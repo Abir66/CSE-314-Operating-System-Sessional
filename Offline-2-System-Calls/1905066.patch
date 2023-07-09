@@ -17,20 +17,21 @@ index 0000000..402e384
 +}
 \ No newline at end of file
 diff --git a/Makefile b/Makefile
-index 39a99d7..b3663db 100644
+index 39a99d7..3b626b6 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -132,6 +132,8 @@ UPROGS=\
+@@ -132,6 +132,9 @@ UPROGS=\
  	$U/_grind\
  	$U/_wc\
  	$U/_zombie\
 +	$U/_trace\
 +	$U/_history\
++	$U/_exit\
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
 diff --git a/kernel/defs.h b/kernel/defs.h
-index a3c962b..5e212e2 100644
+index a3c962b..e4474bf 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
 @@ -8,6 +8,7 @@ struct spinlock;
@@ -57,6 +58,53 @@ index a3c962b..5e212e2 100644
  
  // trap.c
  extern uint     ticks;
+@@ -185,5 +188,8 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++// start.c
++void timerhalt();
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/kernelvec.S b/kernel/kernelvec.S
+index fb31b32..c72c5c2 100644
+--- a/kernel/kernelvec.S
++++ b/kernel/kernelvec.S
+@@ -97,12 +97,17 @@ timervec:
+         # scratch[0,8,16] : register save area.
+         # scratch[24] : address of CLINT's MTIMECMP register.
+         # scratch[32] : desired interval between interrupts.
++        # scratch[40] : halt flag set by timerhalt.
+         
+         csrrw a0, mscratch, a0
+         sd a1, 0(a0)
+         sd a2, 8(a0)
+         sd a3, 16(a0)
+ 
++        # halt if timerhalt has set halt flag to 1
++        ld a1, 40(a0)
++        bne a1, zero, halt
++
+         # schedule the next timer interrupt
+         # by adding interval to mtimecmp.
+         ld a1, 24(a0) # CLINT_MTIMECMP(hart)
+@@ -122,3 +127,14 @@ timervec:
+         csrrw a0, mscratch, a0
+ 
+         mret
++
++halt:
++        # based on qemu's hw/riscv/virt.c:
++        # qemu halts if FINISHER_PASS(=0x5555) is 
++        # written at address *VIRT_TEST(=0x100000L)
++        lui a1, 0x100
++        lui a2, 0x5
++        addi a2, a2, 0x555
++        sw a2, 0(a1)
++spin:
++        j spin
+\ No newline at end of file
 diff --git a/kernel/main.c b/kernel/main.c
 index f0d3171..227d1d3 100644
 --- a/kernel/main.c
@@ -154,8 +202,39 @@ index 4392820..57e8482 100644
  
 +#endif
 \ No newline at end of file
+diff --git a/kernel/start.c b/kernel/start.c
+index e16f18a..edea562 100644
+--- a/kernel/start.c
++++ b/kernel/start.c
+@@ -11,7 +11,7 @@ void timerinit();
+ __attribute__ ((aligned (16))) char stack0[4096 * NCPU];
+ 
+ // a scratch area per CPU for machine-mode timer interrupts.
+-uint64 timer_scratch[NCPU][5];
++uint64 timer_scratch[NCPU][6];
+ 
+ // assembly code in kernelvec.S for machine-mode timer interrupt.
+ extern void timervec();
+@@ -76,6 +76,7 @@ timerinit()
+   uint64 *scratch = &timer_scratch[id][0];
+   scratch[3] = CLINT_MTIMECMP(id);
+   scratch[4] = interval;
++  scratch[5] = 0; // halt flag
+   w_mscratch((uint64)scratch);
+ 
+   // set the machine-mode trap handler.
+@@ -87,3 +88,9 @@ timerinit()
+   // enable machine-mode timer interrupts.
+   w_mie(r_mie() | MIE_MTIE);
+ }
++
++
++void timerhalt()
++{
++  timer_scratch[0][5] = 1;
++}
 diff --git a/kernel/syscall.c b/kernel/syscall.c
-index ed65409..2631c18 100644
+index ed65409..991cc2d 100644
 --- a/kernel/syscall.c
 +++ b/kernel/syscall.c
 @@ -5,27 +5,26 @@
@@ -232,12 +311,13 @@ index ed65409..2631c18 100644
  {
    uint64 addr;
    argaddr(n, &addr);
-@@ -101,47 +98,160 @@ extern uint64 sys_unlink(void);
+@@ -101,47 +98,164 @@ extern uint64 sys_unlink(void);
  extern uint64 sys_link(void);
  extern uint64 sys_mkdir(void);
  extern uint64 sys_close(void);
 +extern uint64 sys_trace(void);
 +extern uint64 sys_history(void);
++extern uint64 sys_halt(void);
  
  // An array mapping syscall numbers from syscall.h
  // to the function that handles the system call.
@@ -286,6 +366,7 @@ index ed65409..2631c18 100644
 +    [SYS_close] sys_close,
 +    [SYS_trace] sys_trace,
 +    [SYS_history] sys_history,
++    [SYS_halt] sys_halt,
  };
  
 -void
@@ -315,6 +396,7 @@ index ed65409..2631c18 100644
 +    [SYS_close] "close",
 +    [SYS_trace] "trace",
 +    [SYS_history] "history",
++    [SYS_halt] "halt",
 +};
 +
 +
@@ -343,12 +425,13 @@ index ed65409..2631c18 100644
 +    [SYS_close] "1",
 +    [SYS_trace] "1",
 +    [SYS_history] "19",
++    [SYS_halt] "",
 +};
 +
-+struct syscall_stat syscall_stats[24];
++struct syscall_stat syscall_stats[25];
 +
 +void syscall_stat_init(){
-+  for(int i = 1; i<24; i++) {
++  for(int i = 1; i<25; i++) {
 +    syscall_stats[i].count = 0;
 +    syscall_stats[i].accum_time = 0;
 +    strncpy(syscall_stats[i].syscall_name, syscall_names[i], 15);
@@ -422,19 +505,20 @@ index ed65409..2631c18 100644
 +}
 \ No newline at end of file
 diff --git a/kernel/syscall.h b/kernel/syscall.h
-index bc5f356..4733bc4 100644
+index bc5f356..cabc838 100644
 --- a/kernel/syscall.h
 +++ b/kernel/syscall.h
-@@ -20,3 +20,5 @@
+@@ -20,3 +20,6 @@
  #define SYS_link   19
  #define SYS_mkdir  20
  #define SYS_close  21
 +#define SYS_trace  22
 +#define SYS_history 23
++#define SYS_halt 24
 \ No newline at end of file
 diff --git a/kernel/syscall_stat.h b/kernel/syscall_stat.h
 new file mode 100644
-index 0000000..17de50b
+index 0000000..f1bc45c
 --- /dev/null
 +++ b/kernel/syscall_stat.h
 @@ -0,0 +1,14 @@
@@ -449,11 +533,11 @@ index 0000000..17de50b
 +    int accum_time;
 +};
 +
-+extern struct syscall_stat syscall_stats[24];
++extern struct syscall_stat syscall_stats[25];
 +
 +#endif
 diff --git a/kernel/sysproc.c b/kernel/sysproc.c
-index 1de184e..9072be9 100644
+index 1de184e..73864c0 100644
 --- a/kernel/sysproc.c
 +++ b/kernel/sysproc.c
 @@ -5,6 +5,7 @@
@@ -464,7 +548,7 @@ index 1de184e..9072be9 100644
  
  uint64
  sys_exit(void)
-@@ -89,3 +90,42 @@ sys_uptime(void)
+@@ -89,3 +90,49 @@ sys_uptime(void)
    release(&tickslock);
    return xticks;
  }
@@ -495,7 +579,7 @@ index 1de184e..9072be9 100644
 +  argaddr(1,&syscall_stat);
 +
 +  // if invalid syscall ID, return -1
-+  if(syscall_id <= 0 || syscall_id > 23) return -1;
++  if(syscall_id <= 0 || syscall_id > 24) return -1;
 +
 +  // copy the syscall_stat struct to user space
 +  acquire(&syscall_stats[syscall_id].lock);
@@ -506,6 +590,31 @@ index 1de184e..9072be9 100644
 +  if(r < 0) return -1;
 +  
 +  return 0;
++}
++
++// https://github.com/mit-pdos/xv6-riscv/issues/60
++uint64
++sys_halt(void){
++  timerhalt();
++  return 0;
++}
+diff --git a/user/exit.c b/user/exit.c
+new file mode 100644
+index 0000000..76f7346
+--- /dev/null
++++ b/user/exit.c
+@@ -0,0 +1,12 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++
++int
++main(int argc, char *argv[])
++{
++    halt();
++    exit(0);
 +}
 diff --git a/user/history.c b/user/history.c
 new file mode 100644
@@ -542,6 +651,20 @@ index 0000000..e1ee6c2
 +  }
 +  exit(0);
 +}
+diff --git a/user/sh.c b/user/sh.c
+index 836ebcb..42a7b4c 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -165,7 +165,8 @@ main(void)
+         fprintf(2, "cannot cd %s\n", buf+3);
+       continue;
+     }
+-    if(fork1() == 0)
++    
++    else if(fork1() == 0)
+       runcmd(parsecmd(buf));
+     wait(0);
+   }
 diff --git a/user/trace.c b/user/trace.c
 new file mode 100644
 index 0000000..1e322ce
@@ -576,7 +699,7 @@ index 0000000..1e322ce
 +  exit(0);
 +}
 diff --git a/user/user.h b/user/user.h
-index 4d398d5..d1d4d28 100644
+index 4d398d5..856b78e 100644
 --- a/user/user.h
 +++ b/user/user.h
 @@ -1,4 +1,5 @@
@@ -585,22 +708,24 @@ index 4d398d5..d1d4d28 100644
  
  // system calls
  int fork(void);
-@@ -22,6 +23,8 @@ int getpid(void);
+@@ -22,6 +23,9 @@ int getpid(void);
  char* sbrk(int);
  int sleep(int);
  int uptime(void);
 +int trace(int);
 +int history(int, struct syscall_stat*);
++void halt(void);
  
  // ulib.c
  int stat(const char*, struct stat*);
 diff --git a/user/usys.pl b/user/usys.pl
-index 01e426e..e2095e4 100755
+index 01e426e..eca8bce 100755
 --- a/user/usys.pl
 +++ b/user/usys.pl
-@@ -36,3 +36,5 @@ entry("getpid");
+@@ -36,3 +36,6 @@ entry("getpid");
  entry("sbrk");
  entry("sleep");
  entry("uptime");
 +entry("trace");
 +entry("history");
++entry("halt");
