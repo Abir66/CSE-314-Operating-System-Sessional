@@ -14,16 +14,23 @@ using namespace std;
 #define PRINTING_FINISHED 3
 #define NUMBER_OF_PRINTERS 4
 #define NUMBER_OF_BINDERS 2
-#define ARRIVAL_TIME_MEAN 5
+#define NUMBER_OF_STAFF 2
+#define STAFF_READ_INTERVAL 4
+#define STUEDENT_ARRIVAL_TIME_MEAN 5
+#define STAFF_ARRIVAL_TIME_MEAN 5
 #define FREE 0
 #define BUSY 1
 
-int no_of_students, no_of_groups, students_per_group;
+int number_of_students, number_of_groups, students_per_group;
 int print_time, bind_time, submit_time;
 int printer_states[NUMBER_OF_PRINTERS + 1];
 Semaphore printer_mutexes[NUMBER_OF_PRINTERS + 1];
 Semaphore bind_station(2);
 Semaphore bind_mutex;
+Semaphore submission_access_mutex;
+Semaphore submission_read_mutex;
+int submission_count = 0;
+int reader_count = 0;
 
 struct Student
 {
@@ -31,10 +38,19 @@ struct Student
     int group_id;
     int printer_id;
     int print_state;
+
+    Student(){}
+    Student(int id){
+        this->id = id;
+        group_id = (id - 1) / students_per_group + 1;
+        printer_id = id % NUMBER_OF_PRINTERS + 1;
+        print_state = NOT_ARRIVED;
+    }
 };
 
 vector<Student> students;
 vector<pthread_t> threads;
+vector<pthread_t> staff_threads;
 vector<Semaphore> printer_s;
 
 bool test_printer(int student_id, int printer_id)
@@ -79,7 +95,7 @@ void give_up_printer(int student_id)
 
     if (!found)
     {
-        for (int i = 1; i <= no_of_students; i++)
+        for (int i = 1; i <= number_of_students; i++)
         {
             if (students[i].printer_id != printer_id || i == student_id || students[i].group_id == group_id) continue;
             found = test_printer(i, printer_id);
@@ -93,7 +109,7 @@ void give_up_printer(int student_id)
 void do_print(int student_id)
 {
     int printer_id = students[student_id].printer_id;
-    sleep(get_random_number(ARRIVAL_TIME_MEAN));
+    sleep(get_random_number(STUEDENT_ARRIVAL_TIME_MEAN));
     SYNCHRONIZED_PRINT("Student " << student_id << " has arrived at printing station : " << printer_id);
 
     // get the assigned printer
@@ -117,7 +133,31 @@ void bind(int student_id){
     bind_station.up();
 }
 
-void *func(void *arg)
+void submit_entry(int group_id){
+    submission_access_mutex.down();
+    SYNCHRONIZED_PRINT("Group " << group_id<<" has stated filling submission entry");
+    sleep(submit_time);
+    submission_count++;
+    SYNCHRONIZED_PRINT("Group "<<group_id<<" has submitted the report.");
+    submission_access_mutex.up();
+}
+
+int read_submission_entry(int staff_id){
+    int data;
+    submission_read_mutex.down();
+    reader_count++;
+    if(reader_count == 1) submission_access_mutex.down();
+    submission_read_mutex.up();
+    data = submission_count;
+    SYNCHRONIZED_PRINT("Staff "<< staff_id<< " has started reading the entry book. No. of submission = "<<data);
+    submission_read_mutex.down();
+    reader_count--;
+    if(reader_count == 0) submission_access_mutex.up();
+    submission_read_mutex.up();
+    if(data == number_of_groups) pthread_exit(NULL);
+}
+
+void *student_routine(void *arg)
 {
     Student *s = (Student *)arg;
     
@@ -136,45 +176,54 @@ void *func(void *arg)
     // bind the assignment
     bind(s->id);
 
-    
+    // submit the report
+    submit_entry(group_id);
+
+    pthread_exit(NULL);    
 }
+
+void *staff_routine(void *arg){
+    int staff_id = (long) arg;
+    sleep(get_random_number(STAFF_ARRIVAL_TIME_MEAN));
+    while(true){
+        sleep(STAFF_READ_INTERVAL);
+        read_submission_entry(staff_id);
+    }
+}
+
 
 int main()
 {
 
     freopen("input.txt", "r", stdin);
-    // freopen("output.txt", "w", stdout);
+    freopen("output.txt", "w", stdout);
 
-    cin >> no_of_students >> no_of_groups;
+    cin >> number_of_students >> students_per_group;
     cin >> print_time >> bind_time >> submit_time;
-    students_per_group = no_of_students / no_of_groups;
+    number_of_groups = number_of_students / students_per_group;
 
-    Student s;
-    students.push_back(s);
-
-    for (int id = 1, group_id = 1; id <= no_of_students; id++)
-    {
-        Student student;
-        student.id = id;
-        student.group_id = group_id;
-        student.printer_id = id % NUMBER_OF_PRINTERS + 1;
-        student.print_state = NOT_ARRIVED;
-        students.push_back(student);
-        if (id % students_per_group == 0) group_id++;
-    }
-
+    students.resize(number_of_students + 1);
+    threads.resize(number_of_students);
+    staff_threads.resize(NUMBER_OF_STAFF);
+    printer_s.resize(number_of_students + 1);
+    
     for (int i = 1; i <= NUMBER_OF_PRINTERS; i++) printer_states[i] = FREE;
-
-    threads.resize(no_of_students);
-    printer_s.resize(no_of_students + 1);
     for (int i = 0; i < printer_s.size(); i++) printer_s[i].down();
+    for(int id = 1; id<=number_of_students; id++) students[id] = Student(id);
 
     begin_time = time(0);
 
-    for (int i = 1; i <= no_of_students; i++)
+    // student threads
+    for (int i = 1; i <= number_of_students; i++)
     {
         Student *s = &students[i];
-        pthread_create(&threads[i - 1], NULL, func, (void *)s);
+        pthread_create(&threads[i - 1], NULL, student_routine, (void *)s);
+    }
+
+    // staff threads
+    for(int i=0; i<NUMBER_OF_STAFF; i++) {
+        long staff_id = i+1;
+        pthread_create(&staff_threads[i], NULL, staff_routine, (void*)staff_id);
     }
 
     pthread_exit(NULL);
