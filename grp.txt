@@ -1,6 +1,0 @@
-  826  pip install pwntools
-  828  pip install pycryptodome
-  829  sudo apt install python3-pip
-  830  pip install pycryptodome
-  842  history | grep 'pip'
-  843  history | grep 'pip' > grp.txt
